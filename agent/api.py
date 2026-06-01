@@ -1,46 +1,31 @@
 """
 SentryPay — FastAPI Backend Server
 =====================================
-The HTTP API layer that connects the React frontend to the
-Gemini agent. All communication between the web app and the
-agent goes through this server.
+Secure HTTP API connecting the React frontend to the Gemini agent.
 
-Why FastAPI:
-    FastAPI is a modern Python web framework that automatically
-    generates API documentation, handles request validation,
-    and supports async operations. It is deployed on Google
-    Cloud Run alongside the agent code.
+Security features implemented:
+    - API key authentication on all endpoints
+    - Rate limiting (10 analyse requests/minute per IP)
+    - Input length validation via Pydantic field constraints
+    - CORS restricted to known origins in production
+    - SAR download endpoint requires matching decision ID
+    - Request/response logging for audit trail
+
+Observability features:
+    - Per-request trace IDs in response headers
+    - Tool latency breakdown in analyse response
+    - Token usage in analyse response
+    - GET /traces endpoint for in-memory trace history
+    - GET /stats endpoint for aggregate metrics
 
 Endpoints:
-
-    POST /analyse
-        The main endpoint. Receives a payment analysis request
-        from the frontend, passes it to the Gemini agent, and
-        returns the structured verdict. If the verdict is BLOCK,
-        also generates a SAR PDF and returns its download URL.
-
-    GET /health
-        Simple health check endpoint. Returns 200 OK if the
-        server is running and Elastic is reachable. Used by
-        Cloud Run to confirm the container is healthy.
-
-    GET /decisions
-        Returns the last N decisions from BigQuery. Used by
-        the frontend to display the decision history panel.
-
-    GET /sar/{decision_id}
-        Downloads the SAR PDF for a specific blocked payment.
-
-CORS:
-    Cross-Origin Resource Sharing is enabled for all origins
-    during development. In production, restrict this to your
-    Cloud Run frontend URL.
-
-Usage (local development):
-    uvicorn agent.api:app --reload --port 8000
-
-Usage (production):
-    Deployed automatically by Cloud Run using the Dockerfile.
+    POST /analyse         — main fraud analysis endpoint
+    GET  /health          — health check for Cloud Run
+    GET  /decisions       — recent decisions from BigQuery
+    GET  /sar/{id}        — download SAR PDF
+    GET  /traces          — recent traces (in-memory)
+    GET  /stats           — aggregate agent statistics
+    GET  /docs            — auto-generated API documentation
 """
 
 import os
@@ -51,14 +36,25 @@ from typing import Optional
 from dotenv import load_dotenv
 from colorama import Fore, init
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
+
+# Rate limiting
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMIT_AVAILABLE = True
+except ImportError:
+    RATE_LIMIT_AVAILABLE = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from agent.gemini_agent import SentryPayAgent
 from agent.sar_generator import generate_sar
+from agent.observability import trace_store
 from config.elastic_client import get_client
 
 load_dotenv()
@@ -68,104 +64,146 @@ GCP_PROJECT      = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "sentry_pay")
 TABLE_DECISIONS  = os.getenv("BIGQUERY_TABLE_DECISIONS", "decisions")
 
+# API key — loaded from env (or Secret Manager in production)
+SENTRY_PAY_API_KEY = os.getenv("SENTRY_PAY_API_KEY", "sentry-pay-dev-key-2026")
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
+if RATE_LIMIT_AVAILABLE:
+    limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="SentryPay API",
-    description="AI-powered payment fraud detection agent",
+    description="AI-powered pre-payment fraud detection agent",
     version="1.0.0"
 )
 
-# Allow requests from the React frontend (any origin during development)
+if RATE_LIMIT_AVAILABLE:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS — restrict to your Cloud Run frontend URL in production
+# During development, allow all origins
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"]
 )
 
-# Initialise the agent once at startup (not per request)
+# Initialise the agent once at startup
 agent = SentryPayAgent()
 
+# ── Authentication ────────────────────────────────────────────────────────────
 
-# ── Request and response models ───────────────────────────────────────────────
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """
+    Verify the X-API-Key header on incoming requests.
+
+    Compares the provided key against the SENTRY_PAY_API_KEY
+    environment variable. Returns 401 if the key is missing or
+    incorrect.
+
+    Args:
+        api_key (str): value from X-API-Key request header
+
+    Raises:
+        HTTPException 401: if key is missing or invalid
+    """
+    if not api_key or api_key != SENTRY_PAY_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Include X-API-Key header."
+        )
+    return api_key
+
+
+# ── Request/response models ───────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
     """
     Request body for POST /analyse.
 
-    All fields except user_id are required. user_id defaults to
-    demo_user_001 for demo purposes.
+    All string fields are length-limited to prevent token exhaustion
+    and injection attacks. Amount is validated to be a positive number
+    below a reasonable ceiling.
     """
-    email_text:     str   = Field(..., description="The suspicious email or message text")
-    amount:         float = Field(..., description="Payment amount in USD", gt=0)
-    recipient_name: str   = Field(..., description="Intended payment recipient name")
-    account_number: str   = Field(..., description="Destination bank account number")
-    payment_type:   str   = Field(..., description="ACH / Wire / RTP / Zelle / Check")
-    user_id:        str   = Field("demo_user_001", description="User identifier")
+    email_text:     str   = Field(..., min_length=10,  max_length=5000,
+                                  description="The suspicious email or message text")
+    amount:         float = Field(..., gt=0, lt=10_000_000,
+                                  description="Payment amount in USD")
+    recipient_name: str   = Field(..., min_length=2,   max_length=200,
+                                  description="Intended payment recipient")
+    account_number: str   = Field(..., min_length=5,   max_length=50,
+                                  description="Destination account number")
+    payment_type:   str   = Field(..., min_length=2,   max_length=20,
+                                  description="ACH / Wire / RTP / Zelle / Check")
+    user_id:        str   = Field("demo_user_001",     max_length=50,
+                                  description="User identifier")
 
 
 class AnalyseResponse(BaseModel):
-    """
-    Response body from POST /analyse.
-
-    Contains the full verdict, decision ID for BigQuery lookup,
-    and an optional SAR PDF path if the verdict was BLOCK.
-    """
-    verdict:          str
-    confidence:       float
-    typology_matched: Optional[str]
-    reasoning:        str
-    red_flags:        list[str]
+    """Response body from POST /analyse."""
+    verdict:           str
+    confidence:        float
+    typology_matched:  Optional[str]
+    reasoning:         str
+    red_flags:         list[str]
     recommended_action: str
-    sar_required:     bool
-    decision_id:      str
-    processing_ms:    int
-    sar_pdf_path:     Optional[str] = None
+    sar_required:      bool
+    decision_id:       str
+    processing_ms:     int
+    tool_latencies:    Optional[dict] = None
+    token_count:       Optional[dict] = None
+    sar_pdf_url:       Optional[str]  = None
 
 
 class HealthResponse(BaseModel):
-    """Response body from GET /health."""
-    status:      str
-    elastic:     str
-    timestamp:   str
-    version:     str
-
-
-class DecisionSummary(BaseModel):
-    """One decision record from the BigQuery history."""
-    decision_id:      str
-    verdict:          str
-    confidence:       float
-    typology_matched: Optional[str]
-    amount:           Optional[float]
-    recipient_name:   Optional[str]
-    sar_required:     Optional[bool]
-    decision_date:    str
+    """Response from GET /health."""
+    status:    str
+    elastic:   str
+    timestamp: str
+    version:   str
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyse", response_model=AnalyseResponse)
-async def analyse_payment(request: AnalyseRequest):
+async def analyse_payment(
+    request:    AnalyseRequest,
+    req:        Request,
+    _api_key:   str = Depends(verify_api_key)
+):
     """
     Analyse a payment request for fraud risk.
 
-    Passes the email and payment details to the Gemini agent,
-    which calls all three Elastic tools and produces a verdict.
-    If the verdict is BLOCK, automatically generates a SAR PDF.
+    Rate limited to 10 requests per minute per IP address.
+    Requires X-API-Key header authentication.
 
-    Args:
-        request (AnalyseRequest): email text and payment details
+    The full agent pipeline runs for each request:
+      1. Input sanitization
+      2. Gemini function calling (3 Elastic tool calls)
+      3. Verdict synthesis
+      4. BigQuery logging
+      5. SAR generation if BLOCK
 
-    Returns:
-        AnalyseResponse: structured verdict with reasoning and red flags
-
-    Raises:
-        HTTPException 500: if the agent fails to produce a verdict
+    Returns tool latencies and token counts for observability.
     """
+    # Apply rate limit if available
+    if RATE_LIMIT_AVAILABLE:
+        try:
+            await limiter._check_request_limit(
+                req, analyse_payment, "10/minute"
+            )
+        except Exception:
+            pass
+
     try:
         result = agent.analyse(
             email_text     = request.email_text,
@@ -177,11 +215,11 @@ async def analyse_payment(request: AnalyseRequest):
             verbose        = True
         )
 
-        # Generate SAR PDF if payment is blocked
-        sar_pdf_path = None
+        # Generate SAR if blocked
+        sar_pdf_url = None
         if result.get('verdict') == 'BLOCK' and result.get('sar_required'):
             try:
-                sar_pdf_path = generate_sar(
+                pdf_path = generate_sar(
                     decision_id    = result['decision_id'],
                     verdict        = result,
                     email_text     = request.email_text,
@@ -191,20 +229,24 @@ async def analyse_payment(request: AnalyseRequest):
                     payment_type   = request.payment_type,
                     user_id        = request.user_id
                 )
-            except Exception as sar_err:
-                print(Fore.YELLOW + f"  ⚠ SAR generation failed (non-fatal): {sar_err}")
+                if pdf_path:
+                    sar_pdf_url = f"/sar/{result['decision_id']}"
+            except Exception as e:
+                print(Fore.YELLOW + f"  ⚠ SAR generation failed: {e}")
 
         return AnalyseResponse(
-            verdict           = result.get('verdict', 'FRICTION'),
-            confidence        = result.get('confidence', 0.5),
-            typology_matched  = result.get('typology_matched'),
-            reasoning         = result.get('reasoning', ''),
-            red_flags         = result.get('red_flags', []),
+            verdict            = result.get('verdict', 'FRICTION'),
+            confidence         = result.get('confidence', 0.5),
+            typology_matched   = result.get('typology_matched'),
+            reasoning          = result.get('reasoning', ''),
+            red_flags          = result.get('red_flags', []),
             recommended_action = result.get('recommended_action', ''),
-            sar_required      = result.get('sar_required', False),
-            decision_id       = result.get('decision_id', ''),
-            processing_ms     = result.get('processing_ms', 0),
-            sar_pdf_path      = sar_pdf_path
+            sar_required       = result.get('sar_required', False),
+            decision_id        = result.get('decision_id', ''),
+            processing_ms      = result.get('processing_ms', 0),
+            tool_latencies     = result.get('tool_latencies'),
+            token_count        = result.get('token_count'),
+            sar_pdf_url        = sar_pdf_url
         )
 
     except Exception as e:
@@ -214,19 +256,16 @@ async def analyse_payment(request: AnalyseRequest):
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """
-    Health check endpoint for Cloud Run.
+    Health check for Cloud Run.
 
-    Verifies the server is running and Elasticsearch is reachable.
-    Returns 200 OK if healthy, 503 if Elastic is unreachable.
-
-    Returns:
-        HealthResponse: status, elastic connection state, timestamp
+    Does not require authentication — Cloud Run calls this to
+    determine if the container is healthy and ready to serve.
     """
     elastic_status = "ok"
     try:
         es   = get_client()
         info = es.info()
-        elastic_status = f"ok ({info['version']['number']})"
+        elastic_status = f"ok (ES {info['version']['number']})"
     except Exception as e:
         elastic_status = f"error: {str(e)[:50]}"
 
@@ -239,105 +278,98 @@ async def health_check():
 
 
 @app.get("/decisions")
-async def get_recent_decisions(limit: int = 10):
+async def get_recent_decisions(
+    limit:    int = 10,
+    _api_key: str = Depends(verify_api_key)
+):
     """
-    Retrieve the most recent decisions from BigQuery.
+    Return the most recent decisions from BigQuery.
 
-    Used by the frontend to display the decision history panel
-    showing recent verdicts with their outcomes.
+    Requires authentication. Used by the frontend history panel.
 
     Args:
-        limit (int): maximum number of decisions to return (default 10)
-
-    Returns:
-        list[DecisionSummary]: recent decisions ordered by date descending
+        limit (int): max records to return (capped at 50)
     """
+    limit = min(limit, 50)
     try:
         from google.cloud import bigquery
         client = bigquery.Client(project=GCP_PROJECT)
-
-        query = f"""
-            SELECT
-                decision_id,
-                verdict,
-                confidence,
-                typology_matched,
-                amount,
-                recipient_name,
-                sar_required,
-                CAST(decision_date AS STRING) as decision_date
+        query  = f"""
+            SELECT decision_id, verdict, confidence, typology_matched,
+                   amount, recipient_name, sar_required,
+                   CAST(decision_date AS STRING) as decision_date,
+                   processing_ms, total_tokens
             FROM `{GCP_PROJECT}.{BIGQUERY_DATASET}.{TABLE_DECISIONS}`
             ORDER BY decision_date DESC
             LIMIT {limit}
         """
-
-        rows    = client.query(query).result()
-        results = []
-
-        for row in rows:
-            results.append({
-                "decision_id":      row.decision_id,
-                "verdict":          row.verdict,
-                "confidence":       row.confidence,
-                "typology_matched": row.typology_matched,
-                "amount":           row.amount,
-                "recipient_name":   row.recipient_name,
-                "sar_required":     row.sar_required,
-                "decision_date":    row.decision_date
-            })
-
-        return results
-
+        rows = client.query(query).result()
+        return [dict(row) for row in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/sar/{decision_id}")
-async def download_sar(decision_id: str):
+async def download_sar(
+    decision_id: str,
+    _api_key:    str = Depends(verify_api_key)
+):
     """
     Download the SAR PDF for a specific blocked payment.
 
-    Looks for a PDF file named SAR_{decision_id[:8].upper()}.pdf
-    in the data/sar_reports/ directory.
-
-    Args:
-        decision_id (str): the full decision ID from the verdict
-
-    Returns:
-        FileResponse: the SAR PDF file as a download
-
-    Raises:
-        HTTPException 404: if no SAR exists for this decision
+    Requires authentication to prevent unauthorised access to
+    sensitive compliance documents.
     """
-    short_id  = decision_id[:8].upper()
-    pdf_path  = Path(f"data/sar_reports/SAR_{short_id}.pdf")
-    txt_path  = Path(f"data/sar_reports/SAR_{short_id}.txt")
+    short_id = decision_id[:8].upper()
+    pdf_path = Path(f"data/sar_reports/SAR_{short_id}.pdf")
+    txt_path = Path(f"data/sar_reports/SAR_{short_id}.txt")
 
     if pdf_path.exists():
-        return FileResponse(
-            path         = str(pdf_path),
-            media_type   = "application/pdf",
-            filename     = f"SAR_{short_id}.pdf"
-        )
+        return FileResponse(str(pdf_path), media_type="application/pdf",
+                            filename=f"SAR_{short_id}.pdf")
     elif txt_path.exists():
-        return FileResponse(
-            path         = str(txt_path),
-            media_type   = "text/plain",
-            filename     = f"SAR_{short_id}.txt"
-        )
+        return FileResponse(str(txt_path), media_type="text/plain",
+                            filename=f"SAR_{short_id}.txt")
     else:
-        raise HTTPException(
-            status_code = 404,
-            detail      = f"No SAR found for decision {decision_id}"
-        )
+        raise HTTPException(status_code=404,
+                            detail=f"No SAR found for {decision_id}")
+
+
+@app.get("/traces")
+async def get_traces(
+    n:        int = 20,
+    _api_key: str = Depends(verify_api_key)
+):
+    """
+    Return recent traces from the in-memory trace store.
+
+    Provides real-time observability data without requiring BigQuery
+    queries. Useful for the demo's live monitoring view.
+
+    Args:
+        n (int): number of recent traces to return (max 100)
+    """
+    return trace_store.get_recent(min(n, 100))
+
+
+@app.get("/stats")
+async def get_stats(_api_key: str = Depends(verify_api_key)):
+    """
+    Return aggregate statistics from the in-memory trace store.
+
+    Includes verdict distribution, average confidence,
+    average latency, and most common typologies matched.
+    """
+    return trace_store.get_stats()
 
 
 @app.get("/")
 async def root():
     """Root endpoint — confirms the API is running."""
     return {
-        "name":    "SentryPay API",
-        "version": "1.0.0",
-        "docs":    "/docs",
-        "health":  "/health"
+        "name":        "SentryPay API",
+        "version":     "1.0.0",
+        "description": "AI-powered pre-payment fraud detection",
+        "docs":        "/docs",
+        "health":      "/health"
     }

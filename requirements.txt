@@ -1,36 +1,42 @@
-# SentryPay — Phase 1 Dependencies
-# Install with: pip install -r requirements.txt
-#
-# Python 3.14 + Apple Silicon (aarch64) compatible
-# Using minimum version bounds instead of exact pins
+# SentryPay — Full Requirements
+# Install: pip install -r requirements.txt
 
-# PDF extraction
+# ── PDF extraction ────────────────────────────────────────────────────────────
 pdfplumber>=0.10.0
 
-# Data processing
+# ── Data processing ───────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
-
-# scipy — only used for drift detection (Phase 4, not needed now)
-# If this fails: pip install scipy --only-binary=:all: --pre
-scipy>=1.11.0
-
-# Synthetic data generation
 Faker>=20.0.0
+openpyxl>=3.1.0
 
-# Elastic
+# ── Elasticsearch ─────────────────────────────────────────────────────────────
 elasticsearch>=8.10.0
 
-# Google Cloud
+# ── Google Cloud ──────────────────────────────────────────────────────────────
 google-cloud-aiplatform>=1.50.0
 google-cloud-bigquery>=3.20.0
+google-cloud-secret-manager>=2.16.0
 
-# Utilities
+# ── Gemini SDK (new) ──────────────────────────────────────────────────────────
+google-genai>=0.8.0
+
+# ── FastAPI backend ───────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
+slowapi>=0.1.9
+
+# ── SAR PDF generation ────────────────────────────────────────────────────────
+reportlab>=4.0.0
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 requests>=2.31.0
 feedparser>=6.0.0
 tqdm>=4.65.0
 colorama>=0.4.6
 
-# Data generation & validation
-openpyxl>=3.1.0
+# ── Observability ─────────────────────────────────────────────────────────────
+langfuse<4.0.0
