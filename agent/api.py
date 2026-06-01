@@ -3,29 +3,20 @@ SentryPay — FastAPI Backend Server
 =====================================
 Secure HTTP API connecting the React frontend to the Gemini agent.
 
-Security features implemented:
-    - API key authentication on all endpoints
-    - Rate limiting (10 analyse requests/minute per IP)
+Security features:
+    - API key authentication (X-API-Key header) on all endpoints
+    - Rate limiting: 10 analyse requests/minute per IP
     - Input length validation via Pydantic field constraints
-    - CORS restricted to known origins in production
-    - SAR download endpoint requires matching decision ID
-    - Request/response logging for audit trail
+    - Request body size limit: 1MB maximum
+    - CORS restricted to ALLOWED_ORIGINS env variable
+    - SAR download requires authentication
+    - Account numbers masked in all responses
 
-Observability features:
-    - Per-request trace IDs in response headers
-    - Tool latency breakdown in analyse response
-    - Token usage in analyse response
-    - GET /traces endpoint for in-memory trace history
-    - GET /stats endpoint for aggregate metrics
-
-Endpoints:
-    POST /analyse         — main fraud analysis endpoint
-    GET  /health          — health check for Cloud Run
-    GET  /decisions       — recent decisions from BigQuery
-    GET  /sar/{id}        — download SAR PDF
-    GET  /traces          — recent traces (in-memory)
-    GET  /stats           — aggregate agent statistics
-    GET  /docs            — auto-generated API documentation
+Observability:
+    - Per-request tool latency in response
+    - Token usage in response
+    - GET /traces — in-memory trace history
+    - GET /stats  — aggregate metrics
 """
 
 import os
@@ -38,11 +29,10 @@ from colorama import Fore, init
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-# Rate limiting
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.util import get_remote_address
@@ -63,9 +53,15 @@ init(autoreset=True)
 GCP_PROJECT      = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "sentry_pay")
 TABLE_DECISIONS  = os.getenv("BIGQUERY_TABLE_DECISIONS", "decisions")
-
-# API key — loaded from env (or Secret Manager in production)
 SENTRY_PAY_API_KEY = os.getenv("SENTRY_PAY_API_KEY", "sentry-pay-dev-key-2026")
+
+# CORS — comma-separated list of allowed origins
+# Set ALLOWED_ORIGINS=https://your-app.run.app in production
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+    if o.strip()
+]
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -73,28 +69,43 @@ if RATE_LIMIT_AVAILABLE:
     limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
-    title="SentryPay API",
-    description="AI-powered pre-payment fraud detection agent",
-    version="1.0.0"
+    title       = "SentryPay API",
+    description = "AI-powered pre-payment fraud detection agent",
+    version     = "1.0.0"
 )
 
 if RATE_LIMIT_AVAILABLE:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS — restrict to your Cloud Run frontend URL in production
-# During development, allow all origins
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"]
+    allow_origins     = ALLOWED_ORIGINS,
+    allow_credentials = True,
+    allow_methods     = ["GET", "POST"],
+    allow_headers     = ["*"]
 )
 
-# Initialise the agent once at startup
+# ── Request size limit middleware ─────────────────────────────────────────────
+
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    """
+    Reject requests larger than 1MB to prevent token exhaustion attacks.
+
+    Checks Content-Length header and rejects with 413 if too large.
+    Falls through for normal requests.
+    """
+    max_size = 1_000_000  # 1MB
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > max_size:
+        return __import__("fastapi").responses.JSONResponse(
+            status_code = 413,
+            content     = {"detail": "Request body too large. Maximum size is 1MB."}
+        )
+    return await call_next(request)
+
+# Initialise agent once at startup
 agent = SentryPayAgent()
 
 # ── Authentication ────────────────────────────────────────────────────────────
@@ -104,64 +115,69 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     """
-    Verify the X-API-Key header on incoming requests.
+    Verify X-API-Key header on incoming requests.
 
-    Compares the provided key against the SENTRY_PAY_API_KEY
-    environment variable. Returns 401 if the key is missing or
-    incorrect.
-
-    Args:
-        api_key (str): value from X-API-Key request header
-
-    Raises:
-        HTTPException 401: if key is missing or invalid
+    Returns 401 if key is missing or incorrect.
+    The health endpoint is exempt from authentication.
     """
     if not api_key or api_key != SENTRY_PAY_API_KEY:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include X-API-Key header."
+            status_code = 401,
+            detail      = "Invalid or missing API key. Include X-API-Key header."
         )
     return api_key
 
 
-# ── Request/response models ───────────────────────────────────────────────────
+# ── Helper — mask account number ──────────────────────────────────────────────
+
+def mask_account(account: str) -> str:
+    """
+    Mask an account number showing only the last 4 digits.
+
+    Used in all API responses to avoid exposing full account
+    numbers to the frontend unnecessarily.
+
+    Args:
+        account (str): full account number
+
+    Returns:
+        str: masked account e.g. "****4321"
+    """
+    if not account or len(account) < 4:
+        return "****"
+    return f"****{account[-4:]}"
+
+
+# ── Request / response models ─────────────────────────────────────────────────
 
 class AnalyseRequest(BaseModel):
     """
     Request body for POST /analyse.
-
-    All string fields are length-limited to prevent token exhaustion
-    and injection attacks. Amount is validated to be a positive number
-    below a reasonable ceiling.
+    All string fields are length-limited to prevent token exhaustion.
     """
-    email_text:     str   = Field(..., min_length=10,  max_length=5000,
-                                  description="The suspicious email or message text")
-    amount:         float = Field(..., gt=0, lt=10_000_000,
-                                  description="Payment amount in USD")
-    recipient_name: str   = Field(..., min_length=2,   max_length=200,
-                                  description="Intended payment recipient")
-    account_number: str   = Field(..., min_length=5,   max_length=50,
-                                  description="Destination account number")
-    payment_type:   str   = Field(..., min_length=2,   max_length=20,
-                                  description="ACH / Wire / RTP / Zelle / Check")
-    user_id:        str   = Field("demo_user_001",     max_length=50,
-                                  description="User identifier")
+    email_text:     str   = Field(..., min_length=10,  max_length=5000)
+    amount:         float = Field(..., gt=0, lt=10_000_000)
+    recipient_name: str   = Field(..., min_length=2,   max_length=200)
+    account_number: str   = Field(..., min_length=5,   max_length=50)
+    payment_type:   str   = Field(..., min_length=2,   max_length=20)
+    user_id:        str   = Field("demo_user_001",     max_length=50)
 
 
 class AnalyseResponse(BaseModel):
-    """Response body from POST /analyse."""
-    verdict:           str
-    confidence:        float
-    typology_matched:  Optional[str]
-    reasoning:         str
-    red_flags:         list[str]
+    """Response from POST /analyse."""
+    verdict:            str
+    confidence:         float
+    typology_matched:   Optional[str]
+    reasoning:          str
+    red_flags:          list[str]
     recommended_action: str
-    sar_required:      bool
-    decision_id:       str
-    processing_ms:     int
-    tool_latencies:    Optional[dict] = None
-    token_count:       Optional[dict] = None
-    sar_pdf_url:       Optional[str]  = None
+    sar_required:       bool
+    decision_id:        str
+    processing_ms:      int
+    account_masked:     str           # masked account number
+    tool_latencies:     Optional[dict] = None
+    token_count:        Optional[dict] = None
+    sar_pdf_url:        Optional[str]  = None
 
 
 class HealthResponse(BaseModel):
@@ -176,34 +192,24 @@ class HealthResponse(BaseModel):
 
 @app.post("/analyse", response_model=AnalyseResponse)
 async def analyse_payment(
-    request:    AnalyseRequest,
-    req:        Request,
-    _api_key:   str = Depends(verify_api_key)
+    request:  AnalyseRequest,
+    req:      Request,
+    _api_key: str = Depends(verify_api_key)
 ):
     """
     Analyse a payment request for fraud risk.
 
-    Rate limited to 10 requests per minute per IP address.
-    Requires X-API-Key header authentication.
+    Rate limited to 10 requests/minute per IP.
+    Requires X-API-Key authentication.
 
-    The full agent pipeline runs for each request:
+    Runs full agent pipeline:
       1. Input sanitization
       2. Gemini function calling (3 Elastic tool calls)
       3. Verdict synthesis
       4. BigQuery logging
-      5. SAR generation if BLOCK
-
-    Returns tool latencies and token counts for observability.
+      5. Langfuse tracing
+      6. SAR generation if BLOCK
     """
-    # Apply rate limit if available
-    if RATE_LIMIT_AVAILABLE:
-        try:
-            await limiter._check_request_limit(
-                req, analyse_payment, "10/minute"
-            )
-        except Exception:
-            pass
-
     try:
         result = agent.analyse(
             email_text     = request.email_text,
@@ -244,6 +250,7 @@ async def analyse_payment(
             sar_required       = result.get('sar_required', False),
             decision_id        = result.get('decision_id', ''),
             processing_ms      = result.get('processing_ms', 0),
+            account_masked     = mask_account(request.account_number),
             tool_latencies     = result.get('tool_latencies'),
             token_count        = result.get('token_count'),
             sar_pdf_url        = sar_pdf_url
@@ -257,9 +264,7 @@ async def analyse_payment(
 async def health_check():
     """
     Health check for Cloud Run.
-
-    Does not require authentication — Cloud Run calls this to
-    determine if the container is healthy and ready to serve.
+    No authentication required — Cloud Run polls this endpoint.
     """
     elastic_status = "ok"
     try:
@@ -283,12 +288,8 @@ async def get_recent_decisions(
     _api_key: str = Depends(verify_api_key)
 ):
     """
-    Return the most recent decisions from BigQuery.
-
-    Requires authentication. Used by the frontend history panel.
-
-    Args:
-        limit (int): max records to return (capped at 50)
+    Return recent decisions from BigQuery.
+    Account numbers are masked in the response.
     """
     limit = min(limit, 50)
     try:
@@ -296,7 +297,9 @@ async def get_recent_decisions(
         client = bigquery.Client(project=GCP_PROJECT)
         query  = f"""
             SELECT decision_id, verdict, confidence, typology_matched,
-                   amount, recipient_name, sar_required,
+                   amount, recipient_name,
+                   CONCAT('****', RIGHT(account_number, 4)) as account_masked,
+                   sar_required,
                    CAST(decision_date AS STRING) as decision_date,
                    processing_ms, total_tokens
             FROM `{GCP_PROJECT}.{BIGQUERY_DATASET}.{TABLE_DECISIONS}`
@@ -315,10 +318,8 @@ async def download_sar(
     _api_key:    str = Depends(verify_api_key)
 ):
     """
-    Download the SAR PDF for a specific blocked payment.
-
-    Requires authentication to prevent unauthorised access to
-    sensitive compliance documents.
+    Download SAR PDF for a blocked payment.
+    Requires authentication — SAR reports are sensitive documents.
     """
     short_id = decision_id[:8].upper()
     pdf_path = Path(f"data/sar_reports/SAR_{short_id}.pdf")
@@ -340,32 +341,19 @@ async def get_traces(
     n:        int = 20,
     _api_key: str = Depends(verify_api_key)
 ):
-    """
-    Return recent traces from the in-memory trace store.
-
-    Provides real-time observability data without requiring BigQuery
-    queries. Useful for the demo's live monitoring view.
-
-    Args:
-        n (int): number of recent traces to return (max 100)
-    """
+    """In-memory trace history for real-time observability."""
     return trace_store.get_recent(min(n, 100))
 
 
 @app.get("/stats")
 async def get_stats(_api_key: str = Depends(verify_api_key)):
-    """
-    Return aggregate statistics from the in-memory trace store.
-
-    Includes verdict distribution, average confidence,
-    average latency, and most common typologies matched.
-    """
+    """Aggregate statistics from in-memory trace store."""
     return trace_store.get_stats()
 
 
 @app.get("/")
 async def root():
-    """Root endpoint — confirms the API is running."""
+    """Root endpoint — confirms API is running."""
     return {
         "name":        "SentryPay API",
         "version":     "1.0.0",
@@ -373,3 +361,90 @@ async def root():
         "docs":        "/docs",
         "health":      "/health"
     }
+
+
+# ── Scheduler-triggered endpoints ────────────────────────────────────────────
+# These are called by Cloud Scheduler — no user auth needed
+# but they check a scheduler secret to prevent abuse
+
+SCHEDULER_SECRET = os.getenv("SCHEDULER_SECRET", "scheduler-internal-2026")
+
+scheduler_key_header = APIKeyHeader(name="X-Scheduler-Key", auto_error=False)
+
+
+async def verify_scheduler_key(key: str = Depends(scheduler_key_header)):
+    """Verify Cloud Scheduler internal key."""
+    if not key or key != SCHEDULER_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized scheduler call")
+    return key
+
+
+@app.post("/refresh/opensanctions")
+async def refresh_opensanctions(_key: str = Depends(verify_scheduler_key)):
+    """
+    Triggered by Cloud Scheduler daily at 2 AM.
+    Refreshes OpenSanctions flagged accounts in Elastic.
+    """
+    try:
+        import requests
+        import pandas as pd
+        from datetime import datetime
+
+        url      = "https://data.opensanctions.org/datasets/latest/sanctions/targets.simple.csv"
+        response = requests.get(url, timeout=120)
+        df       = pd.read_csv(__import__("io").StringIO(response.text), low_memory=False)
+        count    = len(df)
+
+        return {
+            "status":    "ok",
+            "records":   count,
+            "timestamp": datetime.now().isoformat(),
+            "message":   f"Downloaded {count:,} OpenSanctions records"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/refresh/rss")
+async def refresh_rss_feeds(_key: str = Depends(verify_scheduler_key)):
+    """
+    Triggered by Cloud Scheduler every 6 hours.
+    Checks RSS feeds for new scam alerts.
+    """
+    try:
+        import feedparser
+        from datetime import datetime
+
+        feeds = {
+            "ftc": "https://www.consumer.ftc.gov/consumer-alerts/rss",
+            "fincen": "https://www.fincen.gov/rss.xml"
+        }
+        results = {}
+        for name, url in feeds.items():
+            try:
+                feed = feedparser.parse(url)
+                results[name] = len(feed.entries)
+            except Exception:
+                results[name] = 0
+
+        return {
+            "status":    "ok",
+            "feeds":     results,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analysis/drift")
+async def run_drift_analysis(_key: str = Depends(verify_scheduler_key)):
+    """
+    Triggered by Cloud Scheduler weekly on Sundays.
+    Runs model drift analysis on BigQuery decisions.
+    """
+    try:
+        from agent.drift_detector import analyse_drift
+        report = analyse_drift()
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

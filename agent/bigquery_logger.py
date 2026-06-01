@@ -1,18 +1,21 @@
 """
 SentryPay — BigQuery Decision Logger
 ======================================
-Writes every agent verdict to the BigQuery audit table including
-extended observability fields: token usage and per-tool latencies.
+Writes every agent verdict to the BigQuery audit table.
 
-Extended schema (added for observability):
-    prompt_tokens     — Gemini input token count
-    completion_tokens — Gemini output token count
-    total_tokens      — total tokens consumed
-    tool_latencies    — JSON string of per-tool milliseconds
-    trace_id          — OpenTelemetry trace ID for correlation
+Privacy protection:
+    Account numbers are masked before storage — only the last
+    4 digits are stored (e.g. "****4321"). This protects
+    sensitive financial data while preserving enough information
+    for fraud investigation and drift analysis.
+
+Extended observability fields:
+    prompt_tokens, completion_tokens, total_tokens — Gemini usage
+    tool_latencies_json — per-tool millisecond breakdown
 """
 
 import os
+import json
 import uuid
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -32,6 +35,25 @@ def get_bigquery_client() -> bigquery.Client:
     return bigquery.Client(project=GCP_PROJECT)
 
 
+def mask_account(account: str) -> str:
+    """
+    Mask an account number to last 4 digits only.
+
+    Protects sensitive financial data in BigQuery while preserving
+    enough information for investigation. Follows PCI DSS guidance
+    on primary account number truncation.
+
+    Args:
+        account (str): full account number
+
+    Returns:
+        str: masked number e.g. "****4321"
+    """
+    if not account or len(account) < 4:
+        return "****"
+    return f"****{account[-4:]}"
+
+
 def log_decision(
     user_id:          str,
     verdict:          str,
@@ -45,26 +67,26 @@ def log_decision(
     email_text:       str,
     sar_required:     bool,
     processing_ms:    int,
-    token_count:      dict  = None,
-    tool_latencies:   dict  = None
+    token_count:      dict = None,
+    tool_latencies:   dict = None
 ) -> str:
     """
     Write one agent decision to the BigQuery audit table.
 
-    Extended from the base version to include observability fields:
-    token usage breakdown and per-tool latency measurements.
+    Account numbers are masked before storage. Email text is
+    truncated to 500 characters to limit PII exposure.
 
     Args:
         user_id (str): user who submitted the request
         verdict (str): ALLOW, FRICTION, or BLOCK
         confidence (float): agent confidence score (0.0-1.0)
-        typology_matched (str | None): matched scam pattern name
+        typology_matched (str | None): matched scam pattern
         reasoning (str): plain English explanation
         red_flags (list[str]): specific concerns identified
         amount (float): payment amount
         recipient_name (str): intended recipient
-        account_number (str): destination account
-        email_text (str): submitted email text
+        account_number (str): destination account (will be masked)
+        email_text (str): submitted email (truncated to 500 chars)
         sar_required (bool): whether SAR was generated
         processing_ms (int): total processing time
         token_count (dict): Gemini token usage breakdown
@@ -77,26 +99,25 @@ def log_decision(
     token_count  = token_count  or {}
     tool_lats    = tool_latencies or {}
 
-    import json
     row = {
-        "decision_id":        decision_id,
-        "user_id":            user_id,
-        "verdict":            verdict,
-        "confidence":         round(confidence, 4),
-        "typology_matched":   typology_matched,
-        "reasoning":          reasoning,
-        "red_flags":          red_flags,
-        "amount":             amount,
-        "recipient_name":     recipient_name,
-        "account_number":     account_number,
-        "email_snippet":      email_text[:500],
-        "sar_required":       sar_required,
-        "user_feedback":      "UNKNOWN",
-        "decision_date":      datetime.now(timezone.utc).isoformat(),
-        "processing_ms":      processing_ms,
-        "prompt_tokens":      token_count.get("prompt_tokens", 0),
-        "completion_tokens":  token_count.get("completion_tokens", 0),
-        "total_tokens":       token_count.get("total_tokens", 0),
+        "decision_id":         decision_id,
+        "user_id":             user_id,
+        "verdict":             verdict,
+        "confidence":          round(confidence, 4),
+        "typology_matched":    typology_matched,
+        "reasoning":           reasoning,
+        "red_flags":           red_flags,
+        "amount":              amount,
+        "recipient_name":      recipient_name,
+        "account_number":      mask_account(account_number),  # MASKED
+        "email_snippet":       email_text[:500],
+        "sar_required":        sar_required,
+        "user_feedback":       "UNKNOWN",
+        "decision_date":       datetime.now(timezone.utc).isoformat(),
+        "processing_ms":       processing_ms,
+        "prompt_tokens":       token_count.get("prompt_tokens", 0),
+        "completion_tokens":   token_count.get("completion_tokens", 0),
+        "total_tokens":        token_count.get("total_tokens", 0),
         "tool_latencies_json": json.dumps(tool_lats)
     }
 
@@ -106,12 +127,12 @@ def log_decision(
         errors   = client.insert_rows_json(table_id, [row])
 
         if errors:
-            print(Fore.YELLOW + f"  ⚠ BigQuery warning: {errors}")
+            print(Fore.YELLOW + f"BigQuery warning: {errors}")
         else:
-            print(Fore.GREEN + f"  ✓ Logged to BigQuery: {decision_id[:8]}...")
+            print(Fore.GREEN + f"Logged to BigQuery: {decision_id[:8]}...")
 
     except Exception as e:
-        print(Fore.YELLOW + f"  ⚠ BigQuery logging failed (non-fatal): {e}")
+        print(Fore.YELLOW + f"BigQuery logging failed (non-fatal): {e}")
 
     return decision_id
 
@@ -132,6 +153,6 @@ def update_feedback(decision_id: str, feedback: str):
             WHERE decision_id = '{decision_id}'
         """
         client.query(query).result()
-        print(Fore.GREEN + f"  ✓ Feedback: {decision_id[:8]} → {feedback}")
+        print(Fore.GREEN + f"Feedback: {decision_id[:8]} → {feedback}")
     except Exception as e:
-        print(Fore.YELLOW + f"  ⚠ Feedback update failed: {e}")
+        print(Fore.YELLOW + f"Feedback update failed: {e}")

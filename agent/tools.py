@@ -43,6 +43,38 @@ from config.elastic_client import get_client
 
 load_dotenv()
 
+# ── Retry decorator ───────────────────────────────────────────────────────────
+
+def with_retry(max_attempts: int = 3, delay_seconds: float = 2.0):
+    """
+    Retry a tool function on transient network failures.
+    Retries with exponential backoff on ConnectionError, TimeoutError, OSError.
+    """
+    import functools
+    import time as _time
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    last_error = e
+                    if attempt < max_attempts:
+                        wait = delay_seconds * (2 ** (attempt - 1))
+                        print(f"  ⚠ Retry {attempt}/{max_attempts} in {wait:.0f}s: {e}")
+                        _time.sleep(wait)
+                    else:
+                        print(f"  ✗ Failed after {max_attempts} attempts: {e}")
+                except Exception:
+                    raise
+            return {"error": str(last_error), "retry_exhausted": True}
+        return wrapper
+    return decorator
+
+
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_REGION  = os.getenv("GCP_REGION", "us-central1")
 
@@ -54,6 +86,7 @@ _es              = get_client()
 
 # ── Tool 1 — Scam Typology Search ────────────────────────────────────────────
 
+@with_retry(max_attempts=3, delay_seconds=2.0)
 def search_scam_typologies(email_text: str, payment_context: str) -> dict:
     """
     Perform a semantic vector search to find fraud patterns that match
@@ -131,6 +164,7 @@ def search_scam_typologies(email_text: str, payment_context: str) -> dict:
 
 # ── Tool 2 — Beneficiary Account Check ───────────────────────────────────────
 
+@with_retry(max_attempts=3, delay_seconds=2.0)
 def check_beneficiary_account(account_number: str, recipient_name: str) -> dict:
     """
     Query the beneficiary_intel index to score the risk of a destination
@@ -214,6 +248,7 @@ def check_beneficiary_account(account_number: str, recipient_name: str) -> dict:
 
 # ── Tool 3 — Payment Velocity Check ──────────────────────────────────────────
 
+@with_retry(max_attempts=3, delay_seconds=2.0)
 def check_payment_velocity(user_id: str, amount: float,
                            recipient_name: str, account_number: str,
                            payment_type: str) -> dict:

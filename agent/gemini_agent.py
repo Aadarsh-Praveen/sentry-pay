@@ -228,7 +228,11 @@ def sanitize_account_number(account: str) -> str:
     Returns:
         str: sanitized account number
     """
-    return re.sub(r'[^\w\s\-]', '', account)[:50].strip()
+    # Remove non-alphanumeric except hyphens
+    clean = re.sub(r'[^\w\-]', '', account)
+    # Remove ES|QL comment/injection sequences
+    clean = clean.replace('--', '').replace('/*', '').replace('*/', '')
+    return clean[:50].strip()
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────

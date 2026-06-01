@@ -1,0 +1,79 @@
+# ── SentryPay — Cloud Run Service Configuration ───────────────────────────────
+#
+# Deploy with:
+#   gcloud run services replace cloud-run/service.yaml \
+#     --region us-central1
+#
+# Or via Cloud Build (see cloudbuild.yaml)
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sentry-pay
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scale to zero when no traffic (cost saving)
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
+        # Increase timeout for Gemini calls (can take 30s+)
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      # Increase timeout beyond default 60s
+      timeoutSeconds: 300
+      # Memory and CPU
+      containers:
+        - image: gcr.io/PROJECT_ID/sentry-pay:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          env:
+            # Pull secrets from Secret Manager at runtime
+            - name: ELASTIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ELASTIC_API_KEY
+                  key: latest
+            - name: ELASTIC_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: ELASTIC_ENDPOINT
+                  key: latest
+            - name: SENTRY_PAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: SENTRY_PAY_API_KEY
+                  key: latest
+            # Non-secret config
+            - name: GCP_PROJECT_ID
+              value: "sentry-pay"
+            - name: GCP_REGION
+              value: "us-central1"
+            - name: BIGQUERY_DATASET
+              value: "sentry_pay"
+            - name: LANGFUSE_BASE_URL
+              value: "https://cloud.langfuse.com"
+            # CORS — restrict to your frontend URL after deployment
+            - name: ALLOWED_ORIGINS
+              value: "*"
+          # Startup probe — wait for agent to initialise
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          # Liveness probe — restart if unhealthy
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 3
