@@ -1,0 +1,171 @@
+import { useState } from 'react'
+import Header       from './components/Header.jsx'
+import HistoryDrawer from './components/HistoryDrawer.jsx'
+import Dashboard    from './components/Dashboard.jsx'
+import BlockResult  from './components/BlockResult.jsx'
+import FrictionResult from './components/FrictionResult.jsx'
+import AllowResult  from './components/AllowResult.jsx'
+import { analysePayment } from './api/sentrypay.js'
+
+// App views
+const VIEWS = {
+  DASHBOARD: 'dashboard',
+  LOADING:   'loading',
+  RESULT:    'result',
+}
+
+const EMPTY_FORM = {
+  emailText:     '',
+  amount:        '',
+  recipientName: '',
+  accountNumber: '',
+  paymentType:   'Wire Transfer',
+  userId:        'demo_user_001',
+}
+
+export default function App() {
+  const [view,          setView         ] = useState(VIEWS.DASHBOARD)
+  const [form,          setForm         ] = useState(EMPTY_FORM)
+  const [result,        setResult       ] = useState(null)
+  const [error,         setError        ] = useState(null)
+  const [historyOpen,   setHistoryOpen  ] = useState(false)
+
+  function handleChange(field, value) {
+    setForm(prev => ({ ...prev, [field]: value }))
+  }
+
+  function handleLoadDemo(scenario) {
+    setForm({
+      emailText:     scenario.emailText,
+      amount:        scenario.amount,
+      recipientName: scenario.recipientName,
+      accountNumber: scenario.accountNumber,
+      paymentType:   scenario.paymentType,
+      userId:        scenario.userId || 'demo_user_001',
+    })
+    setView(VIEWS.DASHBOARD)
+    setResult(null)
+    setError(null)
+  }
+
+  async function handleSubmit() {
+    if (!form.emailText || !form.amount || !form.recipientName || !form.accountNumber) {
+      setError('Please fill in all required fields.')
+      return
+    }
+    setError(null)
+    setView(VIEWS.LOADING)
+
+    try {
+      const data = await analysePayment({
+        emailText:     form.emailText,
+        amount:        parseFloat(form.amount),
+        recipientName: form.recipientName,
+        accountNumber: form.accountNumber,
+        paymentType:   form.paymentType,
+        userId:        form.userId,
+      })
+      setResult(data)
+      setView(VIEWS.RESULT)
+    } catch (err) {
+      console.error('Analysis failed:', err)
+      setError(
+        err?.response?.data?.detail ||
+        'Analysis failed. Make sure the backend is running on port 8000.'
+      )
+      setView(VIEWS.DASHBOARD)
+    }
+  }
+
+  function handleBack() {
+    setView(VIEWS.DASHBOARD)
+    setResult(null)
+    setError(null)
+  }
+
+  // Render the correct result component based on verdict
+  function renderResult() {
+    if (!result) return null
+    const props = { result, form, onBack: handleBack }
+
+    if (result.verdict === 'BLOCK')    return <BlockResult    {...props} />
+    if (result.verdict === 'FRICTION') return <FrictionResult {...props} />
+    return                                    <AllowResult    {...props} />
+  }
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Header
+        view={view}
+        onLoadDemo={handleLoadDemo}
+        onOpenHistory={() => setHistoryOpen(true)}
+      />
+
+      {/* Error banner */}
+      {error && (
+        <div className="fixed top-16 left-0 right-0 z-40 bg-[#ffdad6] border-b border-[#ba1a1a] px-10 py-3 flex items-center gap-3">
+          <span className="material-symbols-outlined text-[#ba1a1a] text-[20px]">error</span>
+          <span className="text-sm text-[#93000a] font-medium">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="ml-auto material-symbols-outlined text-[#ba1a1a] text-[20px]"
+          >
+            close
+          </button>
+        </div>
+      )}
+
+      {/* Loading state */}
+      {view === VIEWS.LOADING && (
+        <main className="pt-24 min-h-screen flex items-center justify-center">
+          <div className="text-center max-w-sm">
+            <div className="w-24 h-24 mx-auto mb-8 relative flex items-center justify-center">
+              <div className="absolute inset-0 rounded-full bg-surface-container analysis-pulse" />
+              <div className="absolute inset-4 rounded-full bg-surface-container-high analysis-pulse" style={{ animationDelay: '400ms' }} />
+              <span className="material-symbols-filled text-[40px] text-primary relative z-10">security</span>
+            </div>
+            <h2 className="text-2xl font-bold text-primary mb-3">Analysing payment...</h2>
+            <p className="text-sm text-on-surface-variant mb-6">
+              SentryPay is querying 3 Elastic intelligence sources and running Gemini reasoning.
+            </p>
+            <div className="space-y-2">
+              {[
+                'Searching 306 fraud patterns',
+                'Checking 68,564 flagged accounts',
+                'Verifying payment velocity',
+              ].map((step, i) => (
+                <div
+                  key={step}
+                  className="flex items-center gap-3 text-xs text-on-surface-variant bg-surface-container-low rounded-lg px-4 py-2"
+                  style={{ animationDelay: `${i * 200}ms` }}
+                >
+                  <span className="material-symbols-outlined text-primary text-[16px] animate-spin">progress_activity</span>
+                  {step}
+                </div>
+              ))}
+            </div>
+          </div>
+        </main>
+      )}
+
+      {/* Dashboard */}
+      {view === VIEWS.DASHBOARD && (
+        <Dashboard
+          form={form}
+          onChange={handleChange}
+          onSubmit={handleSubmit}
+          loading={false}
+        />
+      )}
+
+      {/* Result */}
+      {view === VIEWS.RESULT && renderResult()}
+
+      {/* History drawer */}
+      <HistoryDrawer
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+      />
+    </div>
+  )
+}
