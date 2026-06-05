@@ -9,29 +9,9 @@ THREE TOOLS:
   2. check_beneficiary_account  — direct lookup against 68k flagged accounts
   3. check_payment_velocity     — anomaly detection vs user's behavioural baseline
 
-ARCHITECTURE:
-    Gemini Agent
-         │
-         ▼
-   [MCP Protocol]
-         │
-         ▼
-   FastMCP Server (this file)
-         │
-         ▼
-   Elasticsearch Serverless
-   (5 indices: scam_typologies, beneficiary_intel,
-    customer_transactions, user_baselines, email_verdicts)
-
 USAGE:
-    # Run in stdio mode (for Claude Desktop / MCP clients):
-    python -m mcp_server.server
-
-    # Run in HTTP / SSE mode (for remote agents, Cloud Run):
-    python -m mcp_server.server --http --port 9000
-
-    # Test it via the demo client:
-    python -m mcp_server.test_client
+    python -m mcp_server.server                       # stdio mode (default)
+    python -m mcp_server.server --http --port 9000    # HTTP/SSE mode
 """
 
 from __future__ import annotations
@@ -42,7 +22,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -58,48 +37,41 @@ load_dotenv()
 
 def get_client():
     """
-    Wrap config.elastic_client.get_client so that:
-      1. Missing credentials surface as a normal exception instead of
-         `sys.exit(1)` (which would kill the whole MCP server process
-         mid-request). MCP tools catch `Exception` but not `SystemExit`.
-      2. Any stdout prints from the upstream client (e.g. "Elastic client
-         ready (Serverless): ...") are redirected to stderr — in stdio mode,
-         stdout is reserved for JSON-RPC frames.
+    Wrap config.elastic_client.get_client so that any stdout it prints
+    (e.g. 'Elastic client ready (Serverless): ...') goes to stderr instead.
+    In stdio mode, stdout is reserved for JSON-RPC protocol frames.
     """
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            return _raw_get_client()
-    except SystemExit as exc:
-        raise RuntimeError(
-            "Elastic client unavailable — check ELASTIC_API_KEY and "
-            "ELASTIC_ENDPOINT (or ELASTIC_CLOUD_ID) in your .env file."
-        ) from exc
+    with contextlib.redirect_stdout(sys.stderr):
+        return _raw_get_client()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [mcp] %(message)s")
+# All logging goes to stderr so stdout stays clean for JSON-RPC protocol
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [mcp] %(message)s",
+    stream=sys.stderr,
+)
 log = logging.getLogger("sentrypay-mcp")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MCP server instance
+
 # ─────────────────────────────────────────────────────────────────────────────
 mcp = FastMCP(
     name="sentrypay",
     instructions=(
-        "SentryPay MCP server. Provides three Elastic-backed tools for payment "
-        "fraud detection: search_scam_typologies for matching known fraud "
-        "patterns via vector search, check_beneficiary_account for querying a "
-        "database of flagged accounts, and check_payment_velocity for "
-        "detecting amount/vendor anomalies against a user's behavioural baseline."
+        "SentryPay MCP server. Three Elastic-backed tools for payment fraud "
+        "detection: search_scam_typologies (kNN vector search for fraud "
+        "patterns), check_beneficiary_account (flagged-account lookup), and "
+        "check_payment_velocity (per-user behavioural anomaly detection)."
     ),
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Vertex AI embedding helper (for scam typology vector search)
+# Vertex AI embedding helper
 # ─────────────────────────────────────────────────────────────────────────────
 _embedding_model = None
 
 
 def _embed_query(text: str) -> list[float]:
-    """Embed text using Vertex AI text-embedding-004 (768-dim)."""
     global _embedding_model
     if _embedding_model is None:
         from vertexai.language_models import TextEmbeddingModel
@@ -125,32 +97,13 @@ def search_scam_typologies(query: str, top_k: int = 3) -> dict:
 
     Returns the top_k known fraud patterns most similar to the input query text
     (typically the body of a suspicious payment email).
-
-    Args:
-        query:  The text to search against (e.g. email body excerpt).
-        top_k:  Number of matches to return (default 3, max 10).
-
-    Returns:
-        {
-          "matches": [
-            {
-              "typology_id": str,
-              "name":        str,        # e.g. "Business Email Compromise"
-              "description": str,
-              "score":       float,      # cosine similarity 0-1
-              "indicators":  [str],      # keyword patterns
-              "loss_avg_usd": float
-            }, ...
-          ],
-          "top_match":  str | None,      # name of #1 match (None if no matches)
-          "top_score":  float            # score of #1 match
-        }
     """
     top_k = max(1, min(top_k, 10))
+    clean_query = " ".join(query.split())[:2000]
 
     try:
         es = get_client()
-        embedding = _embed_query(query)
+        embedding = _embed_query(clean_query)
 
         response = es.search(
             index="scam_typologies",
@@ -175,8 +128,8 @@ def search_scam_typologies(query: str, top_k: int = 3) -> dict:
                 "loss_avg_usd": src.get("loss_avg_usd", 0),
             })
 
-        log.info(f"search_scam_typologies(query={query[:40]!r}) → "
-                 f"{len(matches)} matches, top={matches[0]['name'] if matches else 'None'}")
+        log.info(f"search_scam_typologies → {len(matches)} matches, "
+                 f"top={matches[0]['name'] if matches else 'None'}")
 
         return {
             "matches":   matches,
@@ -196,28 +149,13 @@ def search_scam_typologies(query: str, top_k: int = 3) -> dict:
 def check_beneficiary_account(account_number: str) -> dict:
     """
     Check whether a beneficiary account is in SentryPay's flagged-accounts
-    database (built from OpenSanctions, FinCEN, and community-flagged fraud).
-
-    Args:
-        account_number:  IBAN, routing+account, or similar identifier.
-
-    Returns:
-        {
-          "found":          bool,         # whether the account is flagged
-          "risk_score":     float,        # 0-1 (1 = highest risk)
-          "flag_reasons":   [str],        # why it was flagged
-          "case_count":     int,          # how many prior cases
-          "first_flagged":  str | None,   # ISO date
-        }
+    database (OpenSanctions + FinCEN + community-flagged).
     """
     if not account_number or len(account_number) < 4:
         return {
-            "found":         False,
-            "risk_score":    0.0,
-            "flag_reasons":  [],
-            "case_count":    0,
-            "first_flagged": None,
-            "error":         "Account number too short",
+            "found": False, "risk_score": 0.0, "flag_reasons": [],
+            "case_count": 0, "first_flagged": None,
+            "error": "Account number too short",
         }
 
     try:
@@ -232,11 +170,8 @@ def check_beneficiary_account(account_number: str) -> dict:
         if not hits:
             log.info(f"check_beneficiary_account({account_number[-6:]}) → not flagged")
             return {
-                "found":         False,
-                "risk_score":    0.0,
-                "flag_reasons":  [],
-                "case_count":    0,
-                "first_flagged": None,
+                "found": False, "risk_score": 0.0, "flag_reasons": [],
+                "case_count": 0, "first_flagged": None,
             }
 
         src = hits[0]["_source"]
@@ -254,12 +189,8 @@ def check_beneficiary_account(account_number: str) -> dict:
     except Exception as exc:
         log.error(f"check_beneficiary_account failed: {exc}")
         return {
-            "found":         False,
-            "risk_score":    0.0,
-            "flag_reasons":  [],
-            "case_count":    0,
-            "first_flagged": None,
-            "error":         str(exc),
+            "found": False, "risk_score": 0.0, "flag_reasons": [],
+            "case_count": 0, "first_flagged": None, "error": str(exc),
         }
 
 
@@ -277,25 +208,6 @@ def check_payment_velocity(
     Compare a proposed payment against the user's historical baseline to detect
     amount anomalies, unknown vendors, and account-change patterns characteristic
     of Business Email Compromise (BEC).
-
-    Args:
-        user_id:        User identifier.
-        amount:         Proposed payment amount in USD.
-        recipient_name: Recipient/vendor name (for known-vendor check).
-        account_number: Destination account (for known-account check).
-
-    Returns:
-        {
-          "baseline_exists":   bool,
-          "mean_payment":      float,    # user's average payment size
-          "max_normal":        float,    # IQR upper-fence threshold
-          "current_amount":    float,
-          "deviation_factor":  float,    # current / mean
-          "is_anomaly":        bool,     # current > max_normal
-          "known_vendor":      bool,
-          "known_account":     bool,
-          "account_change_for_known_vendor": bool,   # CRITICAL: BEC indicator
-        }
     """
     try:
         es = get_client()
@@ -306,7 +218,7 @@ def check_payment_velocity(
             return {
                 "baseline_exists":  False,
                 "mean_payment":     0.0,
-                "max_normal":       10_000.0,   # conservative default
+                "max_normal":       10_000.0,
                 "current_amount":   amount,
                 "deviation_factor": 0.0,
                 "is_anomaly":       amount > 10_000,
@@ -321,7 +233,6 @@ def check_payment_velocity(
         known_vendors  = baseline.get("known_vendors",  []) or []
         known_accounts = baseline.get("known_accounts", []) or []
 
-        # Normalize for matching (lowercase, strip)
         norm = lambda s: (s or "").lower().strip()
         recipient_norm = norm(recipient_name)
         known_vendors_norm = [norm(v) for v in known_vendors]
@@ -334,10 +245,14 @@ def check_payment_velocity(
         deviation = (amount / mean_payment) if mean_payment > 0 else 0.0
         is_anomaly = amount > max_normal
 
-        # CRITICAL signal: known vendor at unknown account = vendor banking change
         account_change_for_known_vendor = is_known_vendor and (not is_known_account)
 
-        result = {
+        log.info(f"check_payment_velocity(user={user_id}, ${amount:.2f}) → "
+                 f"anomaly={is_anomaly}, known_vendor={is_known_vendor}, "
+                 f"known_account={is_known_account}, "
+                 f"bec_pattern={account_change_for_known_vendor}")
+
+        return {
             "baseline_exists":  True,
             "mean_payment":     round(mean_payment,   2),
             "max_normal":       round(max_normal,     2),
@@ -348,24 +263,14 @@ def check_payment_velocity(
             "known_account":    is_known_account,
             "account_change_for_known_vendor": account_change_for_known_vendor,
         }
-        log.info(f"check_payment_velocity(user={user_id}, ${amount:.2f}) → "
-                 f"anomaly={is_anomaly}, known_vendor={is_known_vendor}, "
-                 f"known_account={is_known_account}, bec_pattern={account_change_for_known_vendor}")
-        return result
 
     except Exception as exc:
         log.error(f"check_payment_velocity failed: {exc}")
         return {
-            "baseline_exists":  False,
-            "mean_payment":     0.0,
-            "max_normal":       10_000.0,
-            "current_amount":   amount,
-            "deviation_factor": 0.0,
-            "is_anomaly":       False,
-            "known_vendor":     False,
-            "known_account":    False,
-            "account_change_for_known_vendor": False,
-            "error":            str(exc),
+            "baseline_exists": False, "mean_payment": 0.0, "max_normal": 10_000.0,
+            "current_amount":  amount, "deviation_factor": 0.0, "is_anomaly": False,
+            "known_vendor": False, "known_account": False,
+            "account_change_for_known_vendor": False, "error": str(exc),
         }
 
 
@@ -380,30 +285,14 @@ def main():
                         help="Port for HTTP mode (default 9000)")
     args = parser.parse_args()
 
-    # In stdio mode, stdout is reserved for JSON-RPC frames — any stray text
-    # there corrupts the MCP stream and the client logs ParseError tracebacks.
-    # Print the banner to stderr in stdio mode, stdout in HTTP mode.
-    out = sys.stdout if args.http else sys.stderr
-
-    print("", file=out)
-    print("╔══════════════════════════════════════════════════════════════╗", file=out)
-    print("║          SentryPay MCP Server — Elastic Track                ║", file=out)
-    print("╠══════════════════════════════════════════════════════════════╣", file=out)
-    print("║  Tools exposed:                                              ║", file=out)
-    print("║    1. search_scam_typologies   (kNN vector search)           ║", file=out)
-    print("║    2. check_beneficiary_account (structured lookup)          ║", file=out)
-    print("║    3. check_payment_velocity    (per-user aggregations)      ║", file=out)
-    print("╚══════════════════════════════════════════════════════════════╝", file=out)
-    print("", file=out)
-
     if args.http:
-        # FastMCP SSE binds 0.0.0.0:8000 by default; override with env
+        log.info(f"SentryPay MCP server starting in HTTP/SSE mode on port {args.port}")
+        log.info("Tools: search_scam_typologies, check_beneficiary_account, check_payment_velocity")
         os.environ["FASTMCP_PORT"] = str(args.port)
-        print(f"Starting in HTTP/SSE mode on port {args.port}...", file=out)
         mcp.run(transport="sse")
     else:
-        print("Starting in stdio mode (for MCP clients like Claude Desktop)...", file=out)
-        print("Pipe via MCP — no HTTP endpoint.", file=out)
+        log.info("SentryPay MCP server starting in stdio mode")
+        log.info("Tools: search_scam_typologies, check_beneficiary_account, check_payment_velocity")
         mcp.run(transport="stdio")
 
 
