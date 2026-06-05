@@ -334,8 +334,8 @@ def _generate_text_sar(
     Returns:
         str: path to the generated .txt file
     """
-    short_id  = decision_id[:8].upper()
-    filename  = SAR_DIR / f"SAR_{short_id}.txt"
+    short_id = decision_id[:8].upper()
+    filename = SAR_DIR / f"SAR_{short_id}.txt"
     filed_date = datetime.now().strftime("%B %d, %Y")
 
     content = f"""

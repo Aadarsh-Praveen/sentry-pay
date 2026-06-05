@@ -37,13 +37,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.elastic_client import get_client
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
+
 # ── Retry decorator ───────────────────────────────────────────────────────────
+
 
 def with_retry(max_attempts: int = 3, delay_seconds: float = 2.0):
     """
@@ -60,7 +61,7 @@ def with_retry(max_attempts: int = 3, delay_seconds: float = 2.0):
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
-                except (ConnectionError, TimeoutError, OSError) as e:
+                except OSError as e:
                     last_error = e
                     if attempt < max_attempts:
                         wait = delay_seconds * (2 ** (attempt - 1))
@@ -76,12 +77,12 @@ def with_retry(max_attempts: int = 3, delay_seconds: float = 2.0):
 
 
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
-GCP_REGION  = os.getenv("GCP_REGION", "us-central1")
+GCP_REGION = os.getenv("GCP_REGION", "us-central1")
 
 # Initialise shared resources once at module load
 vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
 _embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-_es              = get_client()
+_es = get_client()
 
 
 # ── Tool 1 — Scam Typology Search ────────────────────────────────────────────

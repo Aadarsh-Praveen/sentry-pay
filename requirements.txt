@@ -49,3 +49,6 @@ colorama>=0.4.6
 
 # ── Observability ─────────────────────────────────────────────────────────────
 langfuse<4.0.0
+
+# ── MCP (Model Context Protocol) server ───────────────────────────────────────
+mcp[cli]>=1.0.0
