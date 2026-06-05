@@ -43,10 +43,10 @@ def update_schema():
     table_id = f"{GCP_PROJECT}.{BIGQUERY_DATASET}.{TABLE_DECISIONS}"
 
     try:
-        table          = client.get_table(table_id)
+        table = client.get_table(table_id)
         existing_names = {f.name for f in table.schema}
-        new_schema     = list(table.schema)
-        added          = []
+        new_schema = list(table.schema)
+        added = []
 
         for field in NEW_FIELDS:
             if field.name not in existing_names:
