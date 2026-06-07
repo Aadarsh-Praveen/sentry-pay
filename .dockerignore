@@ -1,0 +1,59 @@
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Virtual environments
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend artifacts (will be built fresh inside Docker)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Secrets — NEVER bake into the image
+.env
+.env.local
+.env.*.local
+*.pem
+service-account*.json
+credentials.json
+
+# Build/test artifacts
+data/sar_reports/*.pdf
+*.log
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Docs and tests (don't need at runtime)
+README.md
+DEPLOY.md
+docs/
+tests/
+notebooks/
+*.ipynb
+*.md
+
+# Setup scripts (only run locally)
+setup/

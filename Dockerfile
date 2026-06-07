@@ -1,73 +1,54 @@
-# ── SentryPay — Dockerfile ────────────────────────────────────────────────────
-#
-# Builds a single container running the FastAPI backend.
-# The React frontend is served as static files by FastAPI
-# after being built separately and copied into the image.
-#
-# Build:
-#   docker build -t sentry-pay .
-#
-# Run locally:
-#   docker run -p 8000:8000 --env-file .env sentry-pay
-#
-# Deploy to Cloud Run:
-#   gcloud run deploy sentry-pay \
-#     --image gcr.io/PROJECT_ID/sentry-pay \
-#     --platform managed \
-#     --region us-central1 \
-#     --allow-unauthenticated \
-#     --timeout 300 \
-#     --memory 2Gi \
-#     --cpu 2
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 1 — Build the React frontend with Vite
+# ═════════════════════════════════════════════════════════════════════════════
+FROM node:20-alpine AS frontend-builder
 
-# ── Base image ────────────────────────────────────────────────────────────────
-# Python 3.12 slim — smaller than 3.14, better package compatibility
+WORKDIR /app/frontend
+
+# Install dependencies first (better Docker layer caching)
+COPY frontend/package*.json ./
+RUN npm ci --silent
+
+# Build the production bundle
+COPY frontend/ ./
+RUN npm run build
+
+# Output is at /app/frontend/dist
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 2 — Python runtime that serves FastAPI + built frontend
+# ═════════════════════════════════════════════════════════════════════════════
 FROM python:3.12-slim
 
-# ── System dependencies ───────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
+WORKDIR /app
+
+# System dependencies for some Python packages (cryptography, lxml etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Working directory ─────────────────────────────────────────────────────────
-WORKDIR /app
+# Python dependencies first (cached)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# ── Python dependencies ───────────────────────────────────────────────────────
-# Copy requirements first to leverage Docker layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Application code
+COPY agent/      ./agent/
+COPY config/     ./config/
+COPY mcp_server/ ./mcp_server/
 
-# ── Application code ──────────────────────────────────────────────────────────
-COPY agent/       ./agent/
-COPY config/      ./config/
-COPY setup/       ./setup/
-COPY .env.example ./
+# Built React frontend (from stage 1)
+COPY --from=frontend-builder /app/frontend/dist ./static
 
-# ── Create required directories ───────────────────────────────────────────────
-RUN mkdir -p data/sar_reports data/processed
+# Where SAR PDFs are written at runtime
+RUN mkdir -p /app/data/sar_reports
 
-# ── Non-root user for security ────────────────────────────────────────────────
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /app
-USER appuser
+# Cloud Run sets PORT=8080 by default
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8080
 
-# ── Port ─────────────────────────────────────────────────────────────────────
-# Cloud Run injects PORT env variable — default to 8000
-ENV PORT=8000
-EXPOSE 8000
-
-# ── Health check ──────────────────────────────────────────────────────────────
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
-
-# ── Start command ─────────────────────────────────────────────────────────────
-# Use shell form to expand $PORT env variable
-CMD uvicorn agent.api:app \
-    --host 0.0.0.0 \
-    --port $PORT \
-    --workers 1 \
-    --timeout-keep-alive 300 \
-    --log-level info
+# Start the FastAPI server
+CMD exec uvicorn agent.api:app --host 0.0.0.0 --port ${PORT} --workers 1
