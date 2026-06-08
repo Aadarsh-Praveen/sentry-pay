@@ -32,6 +32,7 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
+import os
 from pydantic import BaseModel
 
 from config.elastic_client import get_client
