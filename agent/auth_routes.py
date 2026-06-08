@@ -58,7 +58,7 @@ log = logging.getLogger("sentry-pay.auth-routes")
 router = APIRouter()
 
 # Frontend URL — used to redirect after OAuth callback
-FRONTEND_URL = "http://localhost:5173"
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 
 # ────────────────────────────────────────────────────────────────────────────
