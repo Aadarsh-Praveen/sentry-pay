@@ -379,3 +379,62 @@ async def run_drift_analysis(_key: str = Depends(verify_scheduler_key)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+"""
+Serves the built React frontend (from /app/static, written by the Dockerfile)
+as static files. Must come AFTER all API routes so it doesn't intercept them.
+"""
+
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi import HTTPException
+
+# Path to built React app (Dockerfile copies frontend/dist here)
+_STATIC_DIR = Path(__file__).parent.parent / "static"
+
+# Mount in production only — if /static exists
+if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
+
+    # Vite emits everything into /assets — JS bundles, CSS, fonts
+    _ASSETS_DIR = _STATIC_DIR / "assets"
+    if _ASSETS_DIR.exists():
+        app.mount("/assets", StaticFiles(directory=str(_ASSETS_DIR)), name="assets")
+
+    # Serve root-level static files (favicon, manifest, etc.)
+    @app.get("/favicon.svg", include_in_schema=False)
+    async def favicon():
+        f = _STATIC_DIR / "favicon.svg"
+        if f.is_file():
+            return FileResponse(f)
+        raise HTTPException(status_code=404)
+
+    @app.get("/apple-touch-icon.svg", include_in_schema=False)
+    async def apple_touch_icon():
+        f = _STATIC_DIR / "apple-touch-icon.svg"
+        if f.is_file():
+            return FileResponse(f)
+        raise HTTPException(status_code=404)
+
+    # SPA catch-all — MUST be the last route registered.
+    # API routes (defined above) take precedence; anything else falls through
+    # here and gets index.html so React Router can take over.
+    _API_PREFIXES = (
+        "auth/", "gmail/", "feedback/", "learning/",
+        "decisions", "analyse", "sar/", "health",
+        "docs", "openapi.json", "redoc",
+    )
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        # Don't swallow API 404s — let FastAPI return them
+        if full_path.startswith(_API_PREFIXES):
+            raise HTTPException(status_code=404)
+
+        # If the requested file exists in /static (rare — most go through /assets),
+        # serve it
+        file_path = _STATIC_DIR / full_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+
+        # Otherwise return index.html so React Router handles client-side routing
+        return FileResponse(_STATIC_DIR / "index.html")

@@ -26,3 +26,20 @@ build/
 
 # ── Mac ──────────────────────────────────────────────
 .DS_Store
+# ── Cloud Run secrets ────────────────────────────────
+env.cloudrun.yaml
+env.cloudrun.local.yaml
+
+# ── Frontend artifacts ───────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Generated PDFs ───────────────────────────────────
+data/sar_reports/*.pdf
+
+# ── Logs ─────────────────────────────────────────────
+*.log
+gcp-sa-key.json
+*.json # safer broad pattern
