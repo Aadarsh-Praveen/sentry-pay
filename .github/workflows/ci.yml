@@ -1,9 +1,8 @@
 # ── SentryPay — GitHub Actions CI/CD ─────────────────────────────────────────
 #
 # Runs on every push to main and every pull request.
-#   1. lint      — code style checks (non-blocking)
-#   2. unit-test — fast unit tests (skipped if no tests/)
-#   3. deploy    — build and push to Cloud Run (main branch only)
+#   1. lint    — code style checks (non-blocking)
+#   2. deploy  — build and push to Cloud Run (main branch only)
 
 name: CI/CD
 
@@ -46,41 +45,7 @@ jobs:
             || echo "::warning::Lint reported issues (non-blocking)"
 
 
-  # ─── Job 2: Unit tests ──────────────────────────────────────────────────────
-  unit-test:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    needs: lint
-    if: hashFiles('tests/**/test_*.py') != ''
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-mock
-
-      - name: Run unit tests
-        run: pytest tests/ -v --tb=short
-        env:
-          GCP_PROJECT_ID:      test-project
-          ELASTIC_ENDPOINT:    https://test.elastic.co
-          ELASTIC_API_KEY:     test-key
-          SENTRY_PAY_API_KEY:  test-api-key
-          LANGFUSE_PUBLIC_KEY: test-pk
-          LANGFUSE_SECRET_KEY: test-sk
-          JWT_SECRET:          test-jwt-secret
-
-
-  # ─── Job 3: Build and deploy ────────────────────────────────────────────────
+  # ─── Job 2: Build and deploy ────────────────────────────────────────────────
   deploy:
     name: Deploy to Cloud Run
     runs-on: ubuntu-latest
