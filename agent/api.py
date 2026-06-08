@@ -306,7 +306,7 @@ async def get_stats(_api_key: str = Depends(verify_api_key)):
     return trace_store.get_stats()
 
 
-@app.get("/")
+@app.get("/api")
 async def root():
     return {
         "name":        "SentryPay API",
@@ -419,10 +419,11 @@ if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
     # API routes (defined above) take precedence; anything else falls through
     # here and gets index.html so React Router can take over.
     _API_PREFIXES = (
-        "auth/", "gmail/", "feedback/", "learning/",
-        "decisions", "analyse", "sar/", "health",
-        "docs", "openapi.json", "redoc",
-    )
+    "auth/", "gmail/", "feedback/", "learning/",
+    "decisions", "analyse", "sar/", "health",
+    "docs", "openapi.json", "redoc", "api",
+    "traces", "stats", "refresh/", "analysis/",
+)
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):
