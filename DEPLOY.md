@@ -1,236 +1,329 @@
-# SentryPay — Cloud Run Deployment Guide
+# SentryPay — Deployment Guide
 
-Estimated time: **45 minutes** first time, ~5 minutes for redeploys.
+SentryPay deploys to **Google Cloud Run** automatically on every push to `main`, via **GitHub Actions**.
+
+| Path | Time | When to use |
+|------|------|-------------|
+| **GitHub Actions** (default) | Push → live in ~5 min | Every normal change |
+| **`./deploy.sh`** (manual) | One command from your laptop | Hotfixes, first-time setup, debugging the Dockerfile |
+
+---
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
 │       Cloud Run service: sentrypay              │
-│       https://sentrypay-xyz.run.app             │
+│       https://sentrypay-6c5idgmgza-uc.a.run.app │
 │                                                 │
 │  ┌───────────────────────────────────────────┐  │
 │  │   FastAPI (port 8080)                     │  │
-│  │   ├── /auth/*       → OAuth + JWT         │  │
+│  │   ├── /auth/*       → OAuth + JWT + demo  │  │
 │  │   ├── /gmail/*      → Gmail scan + status │  │
 │  │   ├── /analyse      → manual check        │  │
 │  │   ├── /sar/{id}     → SAR PDF download    │  │
-│  │   ├── /decisions    → history             │  │
+│  │   ├── /decisions    → BigQuery history    │  │
+│  │   ├── /api          → API metadata        │  │
 │  │   └── /*            → serves React app    │  │
 │  └───────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────┘
-        │            │           │
-        ▼            ▼           ▼
-  Elastic Cloud  BigQuery    Vertex AI
+        │            │           │           │
+        ▼            ▼           ▼           ▼
+  Elastic Cloud  BigQuery   Vertex AI    Gmail API
 ```
 
-One service, one URL, no CORS.
+One service, one URL, no CORS. The Dockerfile builds the React frontend in stage 1, then copies it into a Python runtime in stage 2. FastAPI serves both the API and the static frontend.
 
 ---
 
-## Prerequisites
+## One-Time Setup (~30 min)
+
+You only do this once. Future deploys happen automatically on `git push`.
+
+### 1. Enable required GCP APIs
 
 ```bash
-# Verify gcloud is installed and authenticated
-gcloud --version
-gcloud auth login
 gcloud config set project sentry-pay
 
-# Enable the APIs we need (one-time, idempotent)
 gcloud services enable \
     run.googleapis.com \
     cloudbuild.googleapis.com \
     containerregistry.googleapis.com \
     bigquery.googleapis.com \
-    aiplatform.googleapis.com
+    aiplatform.googleapis.com \
+    gmail.googleapis.com \
+    iam.googleapis.com
 ```
 
----
+### 2. Grant the Cloud Run runtime service account access to BigQuery + Vertex AI
 
-## Setup (do once)
-
-### 1. Place all deployment files at your project root
-
-```
-sentry-pay/
-├── Dockerfile                       ← new
-├── .dockerignore                    ← new
-├── .gcloudignore                    ← new
-├── deploy.sh                        ← new
-├── env.cloudrun.yaml.template       ← new
-├── agent/
-│   └── api.py                       ← modify (append static-serving block)
-├── frontend/
-├── mcp_server/
-├── config/
-└── requirements.txt
-```
-
-### 2. Update `agent/api.py`
-
-Append the contents of `agent_api_static_patch.py` to the **very end** of your existing `agent/api.py`.
-
-Verify the patch landed:
-```bash
-grep "_STATIC_DIR" agent/api.py
-```
-Should return one match.
-
-### 3. Create your env file
+This is the service account the *running container* uses to talk to GCP services:
 
 ```bash
-cp env.cloudrun.yaml.template env.cloudrun.yaml
-```
-
-Then edit `env.cloudrun.yaml` and paste in your real values from `.env`.
-(Leave `GOOGLE_REDIRECT_URI` as the placeholder for now — you'll set it after the first deploy.)
-
-### 4. Make the script executable
-
-```bash
-chmod +x deploy.sh
-```
-
-### 5. Grant the Cloud Run service account access to BigQuery and Vertex AI
-
-```bash
-# Get the default Compute service account
 PROJECT_NUMBER=$(gcloud projects describe sentry-pay --format='value(projectNumber)')
-SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
-# Grant BigQuery + Vertex AI access
-gcloud projects add-iam-policy-binding sentry-pay \
-    --member="serviceAccount:${SA}" \
-    --role="roles/bigquery.dataEditor"
-
-gcloud projects add-iam-policy-binding sentry-pay \
-    --member="serviceAccount:${SA}" \
-    --role="roles/bigquery.jobUser"
-
-gcloud projects add-iam-policy-binding sentry-pay \
-    --member="serviceAccount:${SA}" \
-    --role="roles/aiplatform.user"
+for role in roles/bigquery.dataEditor roles/bigquery.jobUser roles/aiplatform.user
+do
+    gcloud projects add-iam-policy-binding sentry-pay \
+        --member="serviceAccount:${RUNTIME_SA}" \
+        --role="${role}"
+done
 ```
 
----
+### 3. Create the GitHub Actions deploy service account
 
-## First Deploy
+This is a *separate* service account that GitHub Actions uses to build + deploy:
 
 ```bash
-./deploy.sh
+PROJECT_ID="sentry-pay"
+SA_NAME="github-actions-deploy"
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+gcloud iam service-accounts create ${SA_NAME} \
+    --display-name="GitHub Actions Deployer" \
+    --project=${PROJECT_ID}
+
+for role in \
+    roles/run.admin \
+    roles/cloudbuild.builds.editor \
+    roles/storage.admin \
+    roles/iam.serviceAccountUser \
+    roles/artifactregistry.admin \
+    roles/viewer
+do
+    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="${role}"
+done
+
+# Generate a key file (used as GitHub Secret GCP_SA_KEY)
+gcloud iam service-accounts keys create gcp-sa-key.json \
+    --iam-account=${SA_EMAIL} \
+    --project=${PROJECT_ID}
+
+echo "✓ Key created: gcp-sa-key.json — DO NOT COMMIT"
 ```
 
-What happens:
-1. `gcloud builds submit` — uploads your code to Cloud Build (~30s)
-2. Cloud Build runs the Dockerfile (~4-8 minutes)
-   - Stage 1: `npm ci && npm run build` for the frontend
-   - Stage 2: `pip install -r requirements.txt` + copy code + static files
-   - Pushes the image to `gcr.io/sentry-pay/sentrypay:latest`
-3. `gcloud run deploy` — provisions the service (~1 minute)
-4. Returns the public URL
+⚠️ **`gcp-sa-key.json` is sensitive.** Make sure your `.gitignore` excludes it:
 
-At the end you'll see:
-```
-✓ Deployed successfully
-Public URL: https://sentrypay-abc123def-uc.a.run.app
+```bash
+grep -q "^gcp-sa-key.json$" .gitignore || echo "gcp-sa-key.json" >> .gitignore
 ```
 
----
+### 4. Configure GitHub Secrets
 
-## Post-Deploy (one-time)
+Open: **GitHub repo → Settings → Secrets and variables → Actions → New repository secret**
 
-### 1. Update the OAuth redirect URI
+Add **all of these**:
 
-Edit `env.cloudrun.yaml`:
-```yaml
-GOOGLE_REDIRECT_URI: "https://sentrypay-abc123def-uc.a.run.app/auth/callback"
+| Secret name | Value source |
+|-------------|--------------|
+| `GCP_PROJECT_ID` | `sentry-pay` |
+| `GCP_SA_KEY` | **Entire contents** of `gcp-sa-key.json` |
+| `ELASTIC_ENDPOINT` | From your `.env` |
+| `ELASTIC_API_KEY` | From your `.env` |
+| `SENTRY_PAY_API_KEY` | From your `.env` |
+| `GOOGLE_CLIENT_ID` | From your `.env` |
+| `GOOGLE_CLIENT_SECRET` | From your `.env` |
+| `GOOGLE_REDIRECT_URI` | Use a placeholder for first deploy — you'll update it after |
+| `FRONTEND_URL` | Placeholder for first deploy |
+| `JWT_SECRET` | From your `.env` |
+| `DEMO_USER_EMAIL` | `sentrypaydemo@gmail.com` |
+| `LANGFUSE_PUBLIC_KEY` | From your `.env` |
+| `LANGFUSE_SECRET_KEY` | From your `.env` |
+| `LANGFUSE_HOST` | `https://cloud.langfuse.com` |
+
+### 5. First deploy
+
+```bash
+git add .
+git commit -m "Initial deploy"
+git push origin main
 ```
 
-### 2. Add the URI in Google Cloud Console
+Watch the build at: `https://github.com/<your-org>/sentry-pay/actions`
 
-Go to:
+After ~8 minutes, the workflow will print your public URL — e.g. `https://sentrypay-abc123-uc.a.run.app`.
+
+### 6. Wire up OAuth with the real URL
+
+Now that you have your Cloud Run URL, point Google OAuth at it.
+
+#### a. Update the GitHub Secrets
+
+| Secret | New value |
+|--------|-----------|
+| `GOOGLE_REDIRECT_URI` | `https://<your-url>/auth/callback` |
+| `FRONTEND_URL` | `https://<your-url>` |
+
+#### b. Add the redirect URI in Google Cloud Console
+
 - **Console → APIs & Services → Credentials**
 - Click your OAuth 2.0 Client ID
 - Under **Authorised redirect URIs**, click **+ ADD URI**
-- Paste: `https://sentrypay-abc123def-uc.a.run.app/auth/callback`
-- **Save**
+- Paste: `https://<your-url>/auth/callback`
+- Click **Save**
 
-### 3. Re-deploy with the updated redirect URI
+#### c. Trigger a redeploy
+
+```bash
+git commit --allow-empty -m "Deploy with production OAuth URIs"
+git push origin main
+```
+
+---
+
+## What Happens on Every Push to `main`
+
+```
+┌─────────────────────────────────────────────────────┐
+│  GitHub Actions  (.github/workflows/ci.yml)         │
+│                                                     │
+│  Job 1 — Code quality                               │
+│    ├─ Checkout                                      │
+│    ├─ Python 3.12 setup                             │
+│    └─ flake8 (non-blocking)                         │
+│                                                     │
+│  Job 2 — Deploy to Cloud Run                        │
+│    ├─ Authenticate via GCP_SA_KEY                   │
+│    ├─ Cloud Build (async + poll)                    │
+│    │   ├─ Stage 1: npm ci && npm run build          │
+│    │   └─ Stage 2: pip install + copy code          │
+│    ├─ Tag image as latest                           │
+│    ├─ gcloud run deploy with all env vars           │
+│    ├─ Smoke test (frontend)                         │
+│    ├─ Smoke test (demo auth)                        │
+│    └─ Deployment summary with public URL            │
+└─────────────────────────────────────────────────────┘
+```
+
+Subsequent deploys take **~3-5 minutes** thanks to Cloud Build layer caching.
+
+---
+
+## Manual Deploy (alternative path)
+
+For first-time setup, hotfixes, or debugging the Dockerfile without going through GitHub:
+
+### Setup
+
+```bash
+cp env.cloudrun.yaml.template env.cloudrun.yaml
+# Edit env.cloudrun.yaml — paste real values from your .env
+chmod +x deploy.sh
+```
+
+### Deploy
 
 ```bash
 ./deploy.sh
 ```
+
+This script:
+1. `gcloud builds submit` — uploads to Cloud Build
+2. Cloud Build runs the Dockerfile
+3. `gcloud run deploy` — provisions Cloud Run with env vars from `env.cloudrun.yaml`
+4. Prints the public URL + next steps
 
 ---
 
 ## Smoke Tests
 
 ```bash
-URL="https://sentrypay-abc123def-uc.a.run.app"
+URL="https://sentrypay-6c5idgmgza-uc.a.run.app"
 
 # 1. Frontend loads
 curl -I "${URL}/"
 # Expected: 200 OK, content-type: text/html
 
-# 2. API responds
-curl "${URL}/health" || curl "${URL}/auth/me"
-# Expected: 401 (no JWT) or similar
+# 2. Health endpoint
+curl "${URL}/health"
+# Expected: {"status":"ok","elastic":"ok (ES 9.5.0)",...}
 
 # 3. Demo sign-in works
 curl -X POST "${URL}/auth/demo"
-# Expected: { "jwt": "...", "user": {...} }
+# Expected: {"jwt":"eyJ...", "user": {...}}
 
-# 4. Open in browser
+# 4. Browser smoke test
 open "${URL}"
-# Click "View Demo Account" — should land on the dashboard
+# Click "View Demo Account" → should land on the dashboard
 ```
-
----
-
-## Redeploys (future updates)
-
-Just run:
-```bash
-./deploy.sh
-```
-
-Cloud Build re-uses cached layers, so subsequent builds take ~2-3 minutes instead of 8.
 
 ---
 
 ## Troubleshooting
 
 ### Build fails on `npm ci`
-- Make sure `frontend/package-lock.json` is checked into git (not gitignored).
+- `frontend/package-lock.json` must be checked into git (not gitignored)
+- Check `frontend/package.json` for unresolvable dependency versions
 
 ### Build fails on `pip install`
-- Check `requirements.txt` includes all packages. Run `pip freeze > req.txt` locally and diff.
+- Compare `requirements.txt` against `pip freeze` locally:
+  ```bash
+  pip freeze > /tmp/req_local.txt
+  diff requirements.txt /tmp/req_local.txt
+  ```
 
-### App boots but errors with "credentials not found"
-- The Cloud Run service account doesn't have BigQuery/Vertex AI access.
-- Re-run the IAM commands in Setup step 5.
+### Container fails to start: `NameError: name 'os' is not defined`
+- A module is using `os.getenv(...)` without `import os` at the top
+- Check the Cloud Run logs: `gcloud run services logs read sentrypay --region=us-central1 --limit=50`
 
-### "Failed to create user — BigQuery permission denied"
-- Same as above. The service account needs `bigquery.dataEditor` + `bigquery.jobUser`.
+### Container fails: "credentials not found"
+- The **runtime** service account (default Compute SA) doesn't have BigQuery/Vertex AI access
+- Re-run the IAM commands in [Setup step 2](#2-grant-the-cloud-run-runtime-service-account-access-to-bigquery--vertex-ai)
 
-### "OAuth redirect_uri_mismatch"
-- The URI in `env.cloudrun.yaml` doesn't match the URI in Google Cloud Console.
-- They MUST be exactly equal (including trailing slashes, http vs https).
+### OAuth fails with `redirect_uri_mismatch`
+- The URI in your `GOOGLE_REDIRECT_URI` GitHub Secret must exactly match the URI in Google Cloud Console (including `https`, trailing slash, port)
+- Common mistake: secret has `http://` instead of `https://`
 
-### SAR PDFs fail to generate
-- Cloud Run filesystem is ephemeral but writeable. The Dockerfile creates `/app/data/sar_reports`.
-- If you need persistent storage, switch SAR storage to Cloud Storage (GCS bucket). Not needed for the hackathon demo.
+### OAuth callback redirects to `localhost:5173` in production
+- The `FRONTEND_URL` GitHub Secret is missing or wrong
+- After OAuth callback, the backend uses `FRONTEND_URL` to redirect the user with their JWT
+- Verify: `gcloud run services describe sentrypay --region=us-central1 --format='value(spec.template.spec.containers[0].env[?name=`FRONTEND_URL`].value)'`
 
-### Cold starts feel slow
-- First request after idle takes 5-10 seconds because Cloud Run is loading the container.
-- For the demo, hit the URL once 30s before recording to "warm" the instance.
+### Build succeeded on GCB but GitHub Actions reports failure
+- This used to happen due to `gcloud builds submit` log streaming requiring Viewer role
+- Fixed in `ci.yml` by using `--async` + polling. If you still hit it, add `roles/viewer` to the GitHub Actions service account
+
+### SAR PDFs can't be downloaded after a redeploy
+- Cloud Run filesystem is **ephemeral** — every new revision starts fresh
+- For persistent SAR storage, switch to Cloud Storage (a GCS bucket). Not needed for the demo
+- The PDFs are auto-regenerated when a verdict is re-issued
+
+### Cold starts feel slow in the demo
+- First request after idle takes 5-10 seconds (Cloud Run loads the container)
+- For demo videos, warm the instance 30 seconds before recording:
+  ```bash
+  curl https://sentrypay-6c5idgmgza-uc.a.run.app/health
+  ```
 
 ---
 
 ## Cost Estimate
 
-For the hackathon (sporadic traffic), you'll likely spend **under $5/month**:
-- Cloud Run: free tier covers 2M requests/month
-- Cloud Build: free tier covers 120 build-minutes/day
-- Container Registry: $0.026/GB/month (negligible)
-- Cloud Build storage: ~$0.10/GB/month
+For hackathon traffic patterns (sporadic, low volume), expect **under $5/month total**:
+
+| Service | Monthly cost |
+|---------|--------------|
+| Cloud Run | Free tier covers 2M requests/month |
+| Cloud Build | Free tier covers 120 build-minutes/day |
+| Container Registry | ~$0.026/GB/month |
+| BigQuery | Free tier covers 1 TB queries/month |
+| Vertex AI (Gemini Flash) | ~$0.001 per analysis |
+| Elasticsearch Serverless | Tied to your Elastic Cloud plan |
+
+---
+
+## Production Hardening (post-hackathon)
+
+For a real production deployment, you'd want to:
+
+1. **Migrate secrets to Google Secret Manager** instead of Cloud Run env vars
+2. **Replace the JSON service account key** with [Workload Identity Federation](https://github.com/google-github-actions/auth#setting-up-workload-identity-federation)
+3. **Set up a custom domain** (e.g. `app.sentrypay.io`) via Cloud Run domain mappings
+4. **Enable Cloud Armor** for WAF + DDoS protection
+5. **Switch SAR storage to Cloud Storage** with signed URLs for download
+6. **Run multiple regions** behind a global load balancer
+7. **Enable Cloud Audit Logging** for IAM + Cloud Run + BigQuery
+8. **Add Cloud Monitoring alerts** for error rate, P95 latency, cold-start frequency
