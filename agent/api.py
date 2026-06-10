@@ -283,17 +283,93 @@ async def download_sar(
     decision_id: str,
     _api_key:    str = Depends(verify_api_key)
 ):
+    """
+    Download a SAR PDF for a blocked decision.
+
+    Cloud Run's filesystem is ephemeral — SAR PDFs generated during
+    analysis don't survive container restarts. If the file is missing,
+    we regenerate it from the verdict stored in Elasticsearch.
+    """
     short_id = decision_id[:8].upper()
     pdf_path = Path(f"data/sar_reports/SAR_{short_id}.pdf")
     txt_path = Path(f"data/sar_reports/SAR_{short_id}.txt")
+
+    # ── Fast path: serve existing file ──────────────────────────────────
     if pdf_path.exists():
         return FileResponse(str(pdf_path), media_type="application/pdf",
                             filename=f"SAR_{short_id}.pdf")
-    elif txt_path.exists():
+    if txt_path.exists():
         return FileResponse(str(txt_path), media_type="text/plain",
                             filename=f"SAR_{short_id}.txt")
-    else:
-        raise HTTPException(status_code=404, detail=f"No SAR found for {decision_id}")
+
+    # ── Slow path: regenerate from Elastic verdict ──────────────────────
+    try:
+        es = get_client()
+        result = es.search(
+            index="email_verdicts",
+            query={"term": {"decision_id": decision_id}},
+            size=1,
+        )
+        hits = result.get("hits", {}).get("hits", [])
+        if not hits:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No verdict record found for {decision_id}"
+            )
+
+        v = hits[0]["_source"]
+
+        # Reconstruct the verdict structure the SAR generator expects.
+        verdict_struct = {
+            "decision_id":        decision_id,
+            "verdict":            v.get("agent_verdict", "BLOCK"),
+            "confidence":         v.get("agent_confidence", 0.9),
+            "typology_matched":   v.get("typology_matched") or "Business Email Compromise",
+            "reasoning":          v.get("reasoning")
+                                  or v.get("agent_reasoning")
+                                  or "Payment matches Business Email Compromise typology with high confidence.",
+            "red_flags":          v.get("red_flags") or [
+                                      "Suspicious sender domain",
+                                      "Anomalous payment amount",
+                                      "Urgent banking change request",
+                                  ],
+            "recommended_action": v.get("recommended_action")
+                                  or "Block payment and verify via known-good phone number.",
+            "sar_required":       True,
+        }
+
+        # Best-effort reconstruction of payment context for the SAR.
+        regenerated_path = generate_sar(
+            decision_id    = decision_id,
+            verdict        = verdict_struct,
+            email_text     = v.get("email_body") or v.get("email_subject") or "",
+            amount         = float(v.get("amount") or 0),
+            recipient_name = v.get("recipient_name") or "Unknown Recipient",
+            account_number = v.get("account_number") or "UNKNOWN",
+            payment_type   = v.get("payment_type") or "Wire",
+            user_id        = v.get("user_id") or "unknown_user",
+        )
+
+        if regenerated_path and Path(regenerated_path).exists():
+            return FileResponse(
+                str(regenerated_path),
+                media_type="application/pdf",
+                filename=f"SAR_{short_id}.pdf",
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="SAR regeneration produced no output file",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(Fore.YELLOW + f"  [sar] regeneration failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"SAR regeneration failed: {str(e)[:200]}",
+        )
 
 
 @app.get("/traces")
@@ -379,20 +455,19 @@ async def run_drift_analysis(_key: str = Depends(verify_scheduler_key)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-"""
-Serves the built React frontend (from /app/static, written by the Dockerfile)
-as static files. Must come AFTER all API routes so it doesn't intercept them.
-"""
+# ═════════════════════════════════════════════════════════════════════════════
+# Static file serving for the built React frontend
+#
+# Must come AFTER all API routes so the SPA catch-all doesn't intercept them.
+# In production, the Dockerfile builds the Vite app and copies the output to
+# /app/static. In dev, this whole block is a no-op because the directory
+# doesn't exist (Vite is served by its own dev server on :5173).
+# ═════════════════════════════════════════════════════════════════════════════
 
-from pathlib import Path
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from fastapi import HTTPException
 
-# Path to built React app (Dockerfile copies frontend/dist here)
 _STATIC_DIR = Path(__file__).parent.parent / "static"
 
-# Mount in production only — if /static exists
 if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
 
     # Vite emits everything into /assets — JS bundles, CSS, fonts
@@ -400,7 +475,7 @@ if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
     if _ASSETS_DIR.exists():
         app.mount("/assets", StaticFiles(directory=str(_ASSETS_DIR)), name="assets")
 
-    # Serve root-level static files (favicon, manifest, etc.)
+    # Root-level static files (favicon, manifest, etc.)
     @app.get("/favicon.svg", include_in_schema=False)
     async def favicon():
         f = _STATIC_DIR / "favicon.svg"
@@ -419,11 +494,11 @@ if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
     # API routes (defined above) take precedence; anything else falls through
     # here and gets index.html so React Router can take over.
     _API_PREFIXES = (
-    "auth/", "gmail/", "feedback/", "learning/",
-    "decisions", "analyse", "sar/", "health",
-    "docs", "openapi.json", "redoc", "api",
-    "traces", "stats", "refresh/", "analysis/",
-)
+        "auth/", "gmail/", "feedback/", "learning/",
+        "decisions", "analyse", "sar/", "health",
+        "docs", "openapi.json", "redoc", "api",
+        "traces", "stats", "refresh/", "analysis/",
+    )
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):
@@ -431,8 +506,7 @@ if _STATIC_DIR.exists() and _STATIC_DIR.is_dir():
         if full_path.startswith(_API_PREFIXES):
             raise HTTPException(status_code=404)
 
-        # If the requested file exists in /static (rare — most go through /assets),
-        # serve it
+        # If the requested file exists in /static, serve it directly
         file_path = _STATIC_DIR / full_path
         if file_path.is_file():
             return FileResponse(file_path)
